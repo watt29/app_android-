@@ -1,0 +1,68 @@
+{
+  "result": "success",
+  "botCommands": [
+    {
+      "command": "โทรหาแม่",
+      "name": "แม่",
+      "number": "0812345678",
+      "status": "active"
+    },
+    {
+      "command": "เปิดยูทูบ",
+      "name": "YouTube",
+      "number": "",
+      "status": "active"
+    },
+    {
+      "command": "เปิดอุ่นใจ",
+      "name": "อุ่นใจ",
+      "number": "",
+      "status": "active"
+    }
+  ],
+  "contacts": [
+    {
+      "command": "อันดา",
+      "name": "อันดา",
+      "number": "0891234567",
+      "status": "active"
+    },
+    {
+      "command": "คุณแม่",
+      "name": "แม่",
+      "number": "0812345678",
+      "status": "active"
+    }
+  ],
+  "scamNumbers": [
+    {
+      "number": "0811111111",
+      "label": "มิจฉาชีพ",
+      "source": "official",
+      "note": "ตัวอย่างเบอร์อันตราย",
+      "status": "active",
+      "updatedAt": "2026-06-23 00:00:00"
+    }
+  ],
+  "scamSources": [
+    {
+      "title": "Thai Police Online",
+      "url": "https://www.thaipoliceonline.go.th/",
+      "note": "แหล่งทางการสำหรับตรวจสอบเบอร์เสี่ยง",
+      "status": "active",
+      "updatedAt": "2026-06-23 00:00:00"
+    }
+  ],
+  "deviceRegistry": [
+    {
+      "deviceId": "device-admin-001",
+      "deviceName": "เครื่องแอดมิน",
+      "role": "admin",
+      "model": "Pixel",
+      "appVersion": "1.0.0",
+      "firstSeen": "2026-06-24 00:00:00",
+      "lastSeen": "2026-06-24 00:00:00",
+      "status": "active"
+    }
+  ]
+}
