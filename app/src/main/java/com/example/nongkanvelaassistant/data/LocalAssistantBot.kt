@@ -1235,7 +1235,7 @@ class LocalAssistantBot {
         findScamNumberMatch(matchedContact.number, scamNumbers)?.let { scam ->
             return "เบอร์ของ ${matchedContact.name} ถูกบันทึกว่าเป็นเบอร์เสี่ยงค่ะ แหล่งที่มา: ${displayScamSource(scam.source)}"
         }
-        return "[ACTION:CONFIRM_CALL:${matchedContact.number}:${matchedContact.name}] ต้องการโทรหา ${matchedContact.name} ใช่ไหมคะ ถ้าใช่พูดว่า ยืนยัน ค่ะ"
+        return "[ACTION:CALL:${matchedContact.number}] อุ่นใจกำลังต่อสายโทรออกหา${matchedContact.name}ให้ค่ะ"
     }
 
     private fun handleOpenAppCommand(text: String, apps: List<Pair<String, String>>): String? {

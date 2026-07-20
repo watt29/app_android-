@@ -989,6 +989,19 @@ class LocalAssistantBotTest {
     }
 
     @Test
+    fun testHandleCallKnownContact_callsImmediatelyWithoutConfirmation() {
+        val response = LocalAssistantBot().handle(
+            text = "โทรหาอันดา",
+            contacts = listOf(DeviceContact(1, 1, "อันดา", "0640451730")),
+            apps = emptyList(),
+            consumePendingConfirmation = { null },
+            getEmergencyCallResponse = { "" }
+        )
+
+        assertEquals("[ACTION:CALL:0640451730] อุ่นใจกำลังต่อสายโทรออกหาอันดาให้ค่ะ", response)
+    }
+
+    @Test
     fun testHandleContactSearch_preventFalsePhoneticMatches() {
         val bot = LocalAssistantBot()
         val contacts = listOf(
