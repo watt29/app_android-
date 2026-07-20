@@ -2,6 +2,7 @@ package com.example.nongkanvelaassistant
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.pm.ActivityInfo
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -18,6 +19,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -45,7 +48,10 @@ import android.content.IntentFilter
 import android.content.Intent
 import android.content.Context
 import android.os.BatteryManager
+import android.app.role.RoleManager
 import com.example.nongkanvelaassistant.data.GroqKeyResolver
+import com.example.nongkanvelaassistant.service.EmergencyService
+import com.example.nongkanvelaassistant.data.TelecomCallController
 
 
 
@@ -55,6 +61,7 @@ class MainActivity : ComponentActivity() {
     private var batteryShutdownReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var pendingCallIntent: Intent? = null
 
     private var wasLowBatteryNotified = false
     private var wasDisconnected = false
@@ -69,6 +76,32 @@ class MainActivity : ComponentActivity() {
         } else {
             Toast.makeText(this, "ต้องอนุญาตให้ใช้ไมโครโฟนก่อนนะคะ", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private val requestCallPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val callIntent = pendingCallIntent
+        pendingCallIntent = null
+        if (granted && callIntent != null) {
+            try {
+                val number = callIntent.data?.schemeSpecificPart ?: return@registerForActivityResult
+                if (!TelecomCallController(this).placeNormalCall(number)) {
+                    startActivity(TelecomCallController(this).createDialFallbackIntent(number))
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "ไม่สามารถโทรออกจากเครื่องนี้ได้ค่ะ", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            Toast.makeText(this, "กรุณาอนุญาตสิทธิ์โทรออกเพื่อให้โทรอัตโนมัติค่ะ", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val requestDialerRoleLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val message = if (result.resultCode == RESULT_OK) "ตั้งน้องกาลเวลาเป็นแอปโทรศัพท์หลักแล้วค่ะ" else "ยังไม่ได้ตั้งเป็นแอปโทรศัพท์หลักค่ะ"
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private val createDocumentLauncher = registerForActivityResult(
@@ -100,23 +133,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         
         setupBatteryAndShutdownMonitor()
         setupNetworkMonitor()
+        ContextCompat.startForegroundService(this, Intent(this, EmergencyService::class.java))
 
         setContent {
             NongKanvelaAssistantTheme {
                 val uiState by viewModel.uiState.collectAsState()
 
-                // Auto-listen on app launch
-                LaunchedEffect(Unit) {
-                    checkMicrophonePermissionAndListen()
-                }
-
                 // LaunchedEffect to watch actionIntent changes
                 LaunchedEffect(uiState.actionIntent) {
                     uiState.actionIntent?.let { intent ->
-                        try {
+                        if (intent.action == Intent.ACTION_CALL && ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                            pendingCallIntent = intent
+                            requestCallPermissionLauncher.launch(Manifest.permission.CALL_PHONE)
+                        } else try {
                             startActivity(intent)
                         } catch (e: Exception) {
                             Toast.makeText(this@MainActivity, "ไม่สามารถเปิดแอปที่สั่งการได้ค่ะ", Toast.LENGTH_SHORT).show()
@@ -131,7 +164,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     VoiceAssistantScreen(
                         viewModel = viewModel,
-                        onMicClick = { checkMicrophonePermissionAndListen() }
+                        onMicClick = { checkMicrophonePermissionAndListen() },
+                        onRequestDefaultDialer = { requestDefaultDialerRole() }
                     )
                 }
             }
@@ -140,27 +174,21 @@ class MainActivity : ComponentActivity() {
 
     private fun checkMicrophonePermissionAndListen() {
         val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        val hasFineLocation = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        val hasContacts = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
-        val hasCallLog = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
-        val hasNotifications = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        } else true
-        
-        if (hasAudio && hasFineLocation && hasContacts && hasCallLog && hasNotifications) {
+        if (hasAudio) {
             viewModel.startListening()
         } else {
-            val perms = mutableListOf(
-                Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION,
-                Manifest.permission.READ_CONTACTS,
-                Manifest.permission.READ_CALL_LOG
-            )
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+            requestPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+        }
+    }
+
+    private fun requestDefaultDialerRole() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val roleManager = getSystemService(RoleManager::class.java)
+            if (roleManager.isRoleAvailable(RoleManager.ROLE_DIALER) && !roleManager.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                requestDialerRoleLauncher.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER))
+            } else {
+                Toast.makeText(this, "น้องกาลเวลาเป็นแอปโทรศัพท์หลักอยู่แล้วค่ะ", Toast.LENGTH_SHORT).show()
             }
-            requestPermissionLauncher.launch(perms.toTypedArray())
         }
     }
 
@@ -250,12 +278,15 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun VoiceAssistantScreen(
-    viewModel: VoiceAssistantViewModel, 
-    onMicClick: () -> Unit
+    viewModel: VoiceAssistantViewModel,
+    onMicClick: () -> Unit,
+    onRequestDefaultDialer: () -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val groqKeysCsv by viewModel.groqKeysString.collectAsState()
+    val emergencySystemEnabled by viewModel.emergencySystemEnabled.collectAsState()
+    var showSettingsDialog by rememberSaveable { mutableStateOf(false) }
     var showGroqDialog by rememberSaveable { mutableStateOf(false) }
     var groqKeysDraft by rememberSaveable { mutableStateOf("") }
 
@@ -265,58 +296,49 @@ fun VoiceAssistantScreen(
         }
     }
 
-    val coffeeBrown = Color(0xFF5D4037)
-    val latteCream = Color(0xFFEFEBE9) // Lighter background for better contrast
-    val darkText = Color(0xFF3E2723)
+    val bgDark = Color(0xFF0B0F19)
+    val panelDark = Color(0xFF1E293B)
+    val textLight = Color(0xFFF8FAFC)
+    val textMuted = Color(0xFF94A3B8)
+    val accentNeon = Color(0xFF00D9FF)
+    val errorColor = Color(0xFFEF5350)
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(latteCream)
-            .padding(horizontal = 24.dp, vertical = 32.dp),
+            .background(bgDark)
+            .padding(horizontal = 38.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // App Header
-        Box(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 8.dp)
+                .padding(bottom = 18.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top
         ) {
             Column(
-                modifier = Modifier.align(Alignment.Center),
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.Start
             ) {
                 Text(
-                    text = "อุ่นใจ",
-                    fontSize = 28.sp,
+                    text = "Nong Kanvela",
+                    fontSize = 30.sp,
                     fontWeight = FontWeight.ExtraBold,
-                    color = coffeeBrown,
+                    color = textLight,
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
                 Text(
-                    text = "ผู้ช่วยส่วนตัวดูแลคุณ",
+                    text = "AI Assistant",
                     fontSize = 15.sp,
-                    color = darkText.copy(alpha = 0.6f),
+                    color = accentNeon,
                     fontWeight = FontWeight.Medium,
                 )
-                Text(
-                    text = if (groqKeysCsv.isBlank()) {
-                        "ยังไม่ได้ตั้งค่า Groq API"
-                    } else {
-                        "Groq API พร้อมใช้งาน (${GroqKeyResolver.resolve(groqKeysCsv).size} คีย์)"
-                    },
-                    fontSize = 12.sp,
-                    color = coffeeBrown.copy(alpha = 0.7f),
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(top = 6.dp)
-                )
             }
-
-            TextButton(
-                onClick = { showGroqDialog = true },
-                modifier = Modifier.align(Alignment.TopEnd)
+            IconButton(
+                onClick = { showSettingsDialog = true },
+                modifier = Modifier.size(52.dp)
             ) {
-                Text("ตั้งค่า Groq", color = coffeeBrown, fontWeight = FontWeight.Bold)
+                Text("⚙️", fontSize = 28.sp)
             }
         }
 
@@ -325,9 +347,9 @@ fun VoiceAssistantScreen(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.cardColors(containerColor = panelDark),
+            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
         ) {
             Box(
                 modifier = Modifier
@@ -338,7 +360,7 @@ fun VoiceAssistantScreen(
                 Text(
                     text = uiState.aiResponse,
                     fontSize = 18.sp,
-                    color = darkText,
+                    color = textLight,
                     textAlign = TextAlign.Center,
                     fontWeight = FontWeight.Medium,
                     lineHeight = 26.sp,
@@ -347,13 +369,13 @@ fun VoiceAssistantScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(18.dp))
 
         // User Speech Transcription
         Text(
             text = uiState.transcribedText,
             fontSize = 15.sp,
-            color = coffeeBrown.copy(alpha = 0.8f),
+            color = if (uiState.errorMessage != null) errorColor else textMuted,
             textAlign = TextAlign.Center,
             fontWeight = FontWeight.Medium,
             modifier = Modifier
@@ -361,7 +383,7 @@ fun VoiceAssistantScreen(
                 .padding(horizontal = 16.dp)
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(18.dp))
 
         // Microphone Button
         Button(
@@ -376,7 +398,7 @@ fun VoiceAssistantScreen(
                 .size(80.dp),
             shape = CircleShape,
             colors = ButtonDefaults.buttonColors(
-                containerColor = if (uiState.isListening) Color(0xFFE53935) else coffeeBrown
+                containerColor = if (uiState.isListening) errorColor else panelDark
             ),
             elevation = ButtonDefaults.buttonElevation(
                 defaultElevation = 8.dp,
@@ -384,14 +406,15 @@ fun VoiceAssistantScreen(
             ),
             contentPadding = PaddingValues(0.dp)
         ) {
-            Text(
-                text = "🎤",
-                fontSize = 36.sp,
-                textAlign = TextAlign.Center
+            Icon(
+                imageVector = Icons.Default.Mic,
+                contentDescription = if (uiState.isListening) "กำลังฟัง" else "พูดกับอุ่นใจ",
+                modifier = Modifier.size(46.dp),
+                tint = Color.White
             )
         }
         
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(22.dp))
 
         // Text Input Bar for manual typing
         var textInput by remember { mutableStateOf("") }
@@ -406,19 +429,19 @@ fun VoiceAssistantScreen(
                 placeholder = { 
                     Text(
                         "พิมพ์ถามตรงนี้...",
-                        color = Color.Gray.copy(alpha = 0.5f) // ทำให้ตัวหนังสือจางลง
+                        color = textMuted
                     ) 
                 },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 shape = RoundedCornerShape(24.dp),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = coffeeBrown,
-                    unfocusedBorderColor = coffeeBrown.copy(alpha = 0.3f),
-                    focusedContainerColor = Color.White,
-                    unfocusedContainerColor = Color.White,
-                    focusedTextColor = darkText,
-                    unfocusedTextColor = darkText
+                    focusedBorderColor = accentNeon,
+                    unfocusedBorderColor = panelDark,
+                    focusedContainerColor = panelDark,
+                    unfocusedContainerColor = panelDark,
+                    focusedTextColor = textLight,
+                    unfocusedTextColor = textLight
                 )
             )
             Spacer(modifier = Modifier.width(12.dp))
@@ -430,14 +453,46 @@ fun VoiceAssistantScreen(
                     }
                 },
                 shape = RoundedCornerShape(24.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = coffeeBrown),
+                colors = ButtonDefaults.buttonColors(containerColor = accentNeon),
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)
             ) {
-                Text("ส่ง", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("ส่ง", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = bgDark)
             }
         }
         
         Spacer(modifier = Modifier.height(8.dp))
+    }
+
+    if (showSettingsDialog) {
+        AlertDialog(
+            onDismissRequest = { showSettingsDialog = false },
+            containerColor = panelDark,
+            title = { Text("ตั้งค่า", color = textLight) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        if (emergencySystemEnabled) "⚠️ ระบบฉุกเฉิน: เปิดอยู่" else "⚠️ ระบบฉุกเฉิน: ปิดอยู่",
+                        color = if (emergencySystemEnabled) accentNeon else errorColor
+                    )
+                    Button(
+                        onClick = { viewModel.setEmergencySystemEnabled(!emergencySystemEnabled) },
+                        colors = ButtonDefaults.buttonColors(containerColor = if (emergencySystemEnabled) errorColor else accentNeon)
+                    ) {
+                        Text(if (emergencySystemEnabled) "ปิดระบบฉุกเฉิน" else "เปิดระบบฉุกเฉิน", color = bgDark)
+                    }
+                    Button(
+                        onClick = onRequestDefaultDialer,
+                        colors = ButtonDefaults.buttonColors(containerColor = accentNeon)
+                    ) {
+                        Text("ตั้งเป็นแอปโทรศัพท์หลัก", color = bgDark)
+                    }
+                    TextButton(onClick = { showSettingsDialog = false; showGroqDialog = true }) {
+                        Text("ตั้งค่า Groq API", color = accentNeon)
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("เสร็จสิ้น", color = accentNeon) } }
+        )
     }
 
     if (showGroqDialog) {
@@ -449,7 +504,7 @@ fun VoiceAssistantScreen(
                     Text(
                         text = "วาง Groq API key ได้ 1 คีย์หรือหลายคีย์ คั่นด้วยเครื่องหมายจุลภาค ระบบจะเก็บแบบเข้ารหัสในเครื่อง",
                         fontSize = 13.sp,
-                        color = darkText.copy(alpha = 0.75f)
+                        color = textMuted
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     OutlinedTextField(

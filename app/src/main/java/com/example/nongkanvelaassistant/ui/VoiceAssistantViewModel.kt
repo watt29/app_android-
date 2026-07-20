@@ -39,6 +39,7 @@ import java.util.Date
 import java.util.Calendar
 import com.example.nongkanvelaassistant.data.LocalAssistantBot
 import com.example.nongkanvelaassistant.data.ContactFallbackResolver
+import com.example.nongkanvelaassistant.data.TelecomCallController
 
 data class ChatLog(
     val timestamp: Long = System.currentTimeMillis(),
@@ -65,6 +66,7 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     private val gson = Gson()
     private val httpClient = OkHttpClient()
     private val secureSettingsStore = com.example.nongkanvelaassistant.data.SecureSettingsStore(context)
+    private val telecomCallController by lazy { TelecomCallController(context) }
 
     private val defaultToken = "tbh0AIs4HTO/ckFqrWbsnR4CakkdWbNyrlkMbVm1QF+fRqVuCG/AJ6HGr7EIOnyFB9VXpmb88HtHVmr8BAv5qKmDYgNnaVi322Jj9Bc2g6rE9ZhWKnEN5ROI9UnjuYnggGY9mNaC+yHnTiGX+u7IYwdB04t89/1O/w1cDnyilFU="
     private val defaultUserId = "Uc88eb3896b0e4bcc5fbaa9b78ac1294e"
@@ -80,6 +82,8 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
 
     private val _deviceRole = MutableStateFlow(prefs.getString("device_role", "elder") ?: "elder")
     val deviceRole: StateFlow<String> = _deviceRole.asStateFlow()
+    private val _emergencySystemEnabled = MutableStateFlow(prefs.getBoolean("emergency_system_enabled", true))
+    val emergencySystemEnabled: StateFlow<Boolean> = _emergencySystemEnabled.asStateFlow()
 
     private val defaultGoogleSheetUrl = "https://script.google.com/macros/s/AKfycbxdtIGggPhiEJ0QkGkR-5zre9gEQyRqme7-wqMbDJtqebOIrXk68SSLEtyrPn7fL3QW/exec"
 
@@ -91,6 +95,7 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
 
     private val _remindersList = MutableStateFlow<List<ReminderItem>>(emptyList())
     val remindersList: StateFlow<List<ReminderItem>> = _remindersList.asStateFlow()
+    private var pendingCallConfirmation: Pair<String, String>? = null
 
     init {
         loadHistoryFromDisk()
@@ -150,6 +155,15 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     fun setDeviceRole(role: String) {
         prefs.edit().putString("device_role", role).apply()
         _deviceRole.value = role
+    }
+
+    fun setEmergencySystemEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("emergency_system_enabled", enabled).apply()
+        _emergencySystemEnabled.value = enabled
+        ContextCompat.startForegroundService(context, Intent(context, com.example.nongkanvelaassistant.service.EmergencyService::class.java).apply {
+            action = com.example.nongkanvelaassistant.service.EmergencyService.ACTION_SET_ENABLED
+            putExtra(com.example.nongkanvelaassistant.service.EmergencyService.EXTRA_ENABLED, enabled)
+        })
     }
 
     fun setLineConfig(token: String, userId: String) {
@@ -701,6 +715,14 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     private fun tryLocalCommandFallback(text: String): String? {
+        val normalized = text.lowercase(Locale.getDefault())
+        if (normalized.contains("ช่วยด้วย") || normalized.contains("ฉุกเฉิน")) {
+            if (!_emergencySystemEnabled.value) return "ระบบฉุกเฉินปิดอยู่ค่ะ กรุณาเปิดจากหน้าหลักก่อนนะคะ"
+            ContextCompat.startForegroundService(context, Intent(context, com.example.nongkanvelaassistant.service.EmergencyService::class.java).apply {
+                action = com.example.nongkanvelaassistant.service.EmergencyService.ACTION_TRIGGER_SOS
+            })
+            return "กำลังติดต่อผู้ดูแลฉุกเฉินค่ะ"
+        }
         val bot = LocalAssistantBot()
         val contacts = getDeviceContactsAsDeviceContactList()
         val apps = getInstalledApps()
@@ -737,7 +759,21 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
             getTodayDateText = { getTodayDateText() },
             getReminderSummaryText = { getReminderSummaryText() },
             removeReminderByQuery = { query -> removeReminderByQuery(query) },
-            consumePendingConfirmation = { null },
+            consumePendingConfirmation = { confirmation ->
+                pendingCallConfirmation?.let { pending ->
+                    when (confirmation.trim().lowercase(Locale.getDefault())) {
+                        "ยืนยัน", "ใช่", "ใช่ค่ะ", "ใช่ครับ", "ตกลง" -> {
+                            pendingCallConfirmation = null
+                            "[ACTION:CALL:${pending.first}] อุ่นใจกำลังต่อสายโทรออกหา${pending.second}ให้ค่ะ"
+                        }
+                        "ไม่", "ไม่ใช่", "ยกเลิก", "ไม่ค่ะ", "ไม่ครับ" -> {
+                            pendingCallConfirmation = null
+                            "ยกเลิกการโทรหา${pending.second}แล้วค่ะ"
+                        }
+                        else -> null
+                    }
+                }
+            },
             getEmergencyCallResponse = { "อุ่นใจกำลังติดต่อสายฉุกเฉินให้ค่ะ" }
         )
     }
@@ -959,7 +995,17 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
         var actionIntent: Intent? = null
 
         // Check for specific actions requested by the AI
-        if (response.contains("[ACTION:OPEN_APP:")) {
+        if (response.contains("[ACTION:CONFIRM_CALL:")) {
+            val startIndex = response.indexOf("[ACTION:CONFIRM_CALL:") + 21
+            val endIndex = response.indexOf("]", startIndex)
+            if (startIndex in 21 until endIndex) {
+                val parts = response.substring(startIndex, endIndex).trim().split(":", limit = 2)
+                if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+                    pendingCallConfirmation = parts[0].trim() to parts[1].trim()
+                }
+                finalResponse = (response.substring(0, response.indexOf("[ACTION:CONFIRM_CALL:")) + response.substring(endIndex + 1)).trim()
+            }
+        } else if (response.contains("[ACTION:OPEN_APP:")) {
             val startIndex = response.indexOf("[ACTION:OPEN_APP:") + 17
             val endIndex = response.indexOf("]", startIndex)
             if (startIndex in 17 until endIndex) {
@@ -1003,8 +1049,14 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
                                 response.substring(endIndex + 1)
                 finalResponse = finalResponse.trim()
                 
-                actionIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phoneNumber")).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+                    if (!telecomCallController.placeNormalCall(phoneNumber)) {
+                        actionIntent = telecomCallController.createDialFallbackIntent(phoneNumber)
+                    }
+                } else {
+                    actionIntent = Intent(Intent.ACTION_CALL, android.net.Uri.parse("tel:$phoneNumber")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
                 }
             }
         } else if (response.contains("[ACTION:VOLUME_ON]")) {
@@ -1137,19 +1189,18 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     override fun onEndOfSpeech() {}
     
     override fun onError(error: Int) {
-        val errorMessage = when (error) {
-            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-            SpeechRecognizer.ERROR_CLIENT -> "Client side error"
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
-            SpeechRecognizer.ERROR_NETWORK -> "Network error"
-            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-            SpeechRecognizer.ERROR_NO_MATCH -> "No match found. Please try speaking again."
-            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "RecognitionService busy"
-            SpeechRecognizer.ERROR_SERVER -> "Error from server"
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
-            else -> "Didn't understand, please try again."
+        // Silence is normal for an elderly-friendly voice UI; do not show technical errors.
+        val gentleMessage = when (error) {
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "กรุณาอนุญาตการใช้ไมโครโฟนก่อนนะคะ"
+            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "สัญญาณอินเทอร์เน็ตขัดข้องค่ะ ลองใหม่ภายหลังได้นะคะ"
+            else -> ""
         }
-        _uiState.value = _uiState.value.copy(isListening = false, transcribedText = "ข้อผิดพลาด: $errorMessage")
+        _uiState.value = _uiState.value.copy(
+            isListening = false,
+            transcribedText = "",
+            errorMessage = gentleMessage.takeIf { it.isNotBlank() },
+            aiResponse = if (gentleMessage.isBlank()) _uiState.value.aiResponse else gentleMessage
+        )
     }
 
     override fun onResults(results: Bundle?) {

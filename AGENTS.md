@@ -107,6 +107,14 @@ chore: update AGENTS guidance
 
 ## Practical Notes
 
+## AI Continuity (Required Before Any Edit)
+
+- Read `HANDOFF.md` and `PLAN.md` before changing code. They describe the current delivered behavior and unfinished work.
+- Treat the connected phone as the delivery target, not an old APK in the workspace. Before claiming a change is current, run `adb shell dumpsys package com.example.nongkanvelaassistant` and compare `lastUpdateTime` after installation.
+- Inspect the existing owner files before editing. Do not recreate an older implementation from chat memory or overwrite current work with a stale version.
+- After every material change, update `HANDOFF.md` with: the user-visible behavior, files changed, verification completed, and a concise next safe test.
+- Preserve unrelated dirty-worktree changes. If the current state cannot be established, stop and report that uncertainty rather than guessing.
+
 - Groq uses the OpenAI-compatible chat completions endpoint.
 - The app already supports multiple Groq keys; rotate keys on success and retryable failure.
 - If a task touches AI behavior, update or add tests for the exact user phrase that triggered the change.
