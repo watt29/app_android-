@@ -5,7 +5,7 @@ Update this file whenever a user-visible change is delivered. Every new AI must 
 ## Delivered state (2026-07-20)
 
 - Installed package: `com.example.nongkanvelaassistant`.
-- Latest verified phone install time: `2026-07-20 14:42:04` (this value changes after each later install; verify it again before work).
+- Latest verified phone install time: `2026-07-20 16:05:53` (this value changes after each later install; verify it again before work).
 - The app is the current default phone app on the connected Android phone.
 - Opening the app shows the voice assistant. The user taps the standard microphone icon and can say `โทรหา <ชื่อ>`; names are resolved from the device contacts.
 - The manual contacts list remains only as a dial-screen fallback, not the launch screen.
