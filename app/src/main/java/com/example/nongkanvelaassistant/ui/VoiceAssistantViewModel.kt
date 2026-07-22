@@ -1,4 +1,4 @@
-package com.example.nongkanvelaassistant.ui
+﻿package com.example.nongkanvelaassistant.ui
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -10,7 +10,16 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -31,6 +40,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.io.FileOutputStream
 import java.util.Locale
 import android.os.BatteryManager
 import android.content.IntentFilter
@@ -53,6 +63,15 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     private val repository = NongKanvelaRepository()
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
+    private var voiceAudioRecord: AudioRecord? = null
+    private var voiceAudioPipe: ParcelFileDescriptor? = null
+    private var voiceRecognizerPipe: ParcelFileDescriptor? = null
+    private var voiceCaptureActive = false
+    private var noiseSuppressor: NoiseSuppressor? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private val recognitionHandler = Handler(Looper.getMainLooper())
+    private var continuousVoiceSessionEnabled = false
+    private var recognitionPausedForSpeech = false
     private val context: Context get() = getApplication<Application>().applicationContext
     private val fusedLocationClient: FusedLocationProviderClient = LocationServices.getFusedLocationProviderClient(context)
 
@@ -63,6 +82,10 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     val conversationHistory: StateFlow<List<ChatLog>> = _conversationHistory.asStateFlow()
 
     private val prefs = context.getSharedPreferences("nongkanvela_prefs", Context.MODE_PRIVATE)
+    private val appVoiceAliasesKey = "app_voice_aliases"
+    private val behaviorLearningStorage by lazy {
+        com.example.nongkanvelaassistant.data.BehaviorLearningStorage(context)
+    }
     private val gson = Gson()
     private val httpClient = OkHttpClient()
     private val secureSettingsStore = com.example.nongkanvelaassistant.data.SecureSettingsStore(context)
@@ -77,7 +100,7 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     private val _lineUserId = MutableStateFlow(prefs.getString("line_user_id", defaultUserId) ?: defaultUserId)
     val lineUserId: StateFlow<String> = _lineUserId.asStateFlow()
 
-    private val _elderName = MutableStateFlow(prefs.getString("elder_name", "คุณตา/คุณยาย") ?: "คุณตา/คุณยาย")
+    private val _elderName = MutableStateFlow(prefs.getString("elder_name", "ผู้ใช้") ?: "ผู้ใช้")
     val elderName: StateFlow<String> = _elderName.asStateFlow()
 
     private val _deviceRole = MutableStateFlow(prefs.getString("device_role", "elder") ?: "elder")
@@ -121,6 +144,16 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
         viewModelScope.launch(Dispatchers.IO) {
             com.example.nongkanvelaassistant.data.ReminderScheduler.cancel(context, reminderId)
             com.example.nongkanvelaassistant.data.ReminderStorage.remove(context, reminderId)
+            loadReminders()
+        }
+    }
+
+    private fun cancelAllAppReminders() {
+        viewModelScope.launch(Dispatchers.IO) {
+            com.example.nongkanvelaassistant.data.ReminderStorage.load(context).forEach { reminder ->
+                com.example.nongkanvelaassistant.data.ReminderScheduler.cancel(context, reminder.id)
+                com.example.nongkanvelaassistant.data.ReminderStorage.remove(context, reminder.id)
+            }
             loadReminders()
         }
     }
@@ -375,6 +408,14 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun startListening() {
+        continuousVoiceSessionEnabled = true
+        recognitionPausedForSpeech = false
+        recognitionHandler.removeCallbacksAndMessages(null)
+        startRecognitionAttempt()
+    }
+
+    private fun startRecognitionAttempt() {
+        if (!continuousVoiceSessionEnabled) return
         try {
             speechRecognizer?.destroy()
         } catch (e: Exception) {
@@ -395,8 +436,100 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun stopListening() {
-        speechRecognizer?.stopListening()
+        continuousVoiceSessionEnabled = false
+        recognitionPausedForSpeech = false
+        recognitionHandler.removeCallbacksAndMessages(null)
+        speechRecognizer?.cancel()
+        stopNoiseReducedAudioSource()
+        _uiState.value = _uiState.value.copy(isListening = false, transcribedText = "หยุดฟังแล้วค่ะ")
+    }
+
+    private fun pauseRecognitionForSpeech() {
+        recognitionPausedForSpeech = true
+        speechRecognizer?.cancel()
+        stopNoiseReducedAudioSource()
+    }
+
+    private fun stopListeningForExternalAction() {
+        continuousVoiceSessionEnabled = false
+        recognitionPausedForSpeech = false
+        recognitionHandler.removeCallbacksAndMessages(null)
+        speechRecognizer?.cancel()
+        stopNoiseReducedAudioSource()
         _uiState.value = _uiState.value.copy(isListening = false)
+    }
+
+    private fun startNoiseReducedAudioSource(): ParcelFileDescriptor? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+        stopNoiseReducedAudioSource()
+        return try {
+            val sampleRate = 16_000
+            val minBuffer = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuffer <= 0) return null
+            val record = AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuffer * 2)
+                .build()
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                record.release()
+                return null
+            }
+            noiseSuppressor = if (NoiseSuppressor.isAvailable()) {
+                NoiseSuppressor.create(record.audioSessionId)?.also { it.enabled = true }
+            } else null
+            echoCanceler = if (AcousticEchoCanceler.isAvailable()) {
+                AcousticEchoCanceler.create(record.audioSessionId)?.also { it.enabled = true }
+            } else null
+            val pipe = ParcelFileDescriptor.createPipe()
+            voiceAudioRecord = record
+            voiceAudioPipe = pipe[1]
+            voiceRecognizerPipe = pipe[0]
+            voiceCaptureActive = true
+            record.startRecording()
+            Thread {
+                val buffer = ByteArray(minBuffer)
+                try {
+                    FileOutputStream(pipe[1].fileDescriptor).use { output ->
+                        while (voiceCaptureActive) {
+                            val count = record.read(buffer, 0, buffer.size)
+                            if (count > 0) output.write(buffer, 0, count)
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Recognition falls back to the platform microphone on the next attempt.
+                }
+            }.apply { name = "NongKanvelaVoiceCapture"; start() }
+            voiceRecognizerPipe
+        } catch (_: Exception) {
+            stopNoiseReducedAudioSource()
+            null
+        }
+    }
+
+    private fun stopNoiseReducedAudioSource() {
+        voiceCaptureActive = false
+        runCatching { voiceAudioRecord?.stop() }
+        runCatching { voiceAudioRecord?.release() }
+        voiceAudioRecord = null
+        runCatching { voiceAudioPipe?.close() }
+        voiceAudioPipe = null
+        runCatching { voiceRecognizerPipe?.close() }
+        voiceRecognizerPipe = null
+        noiseSuppressor?.release()
+        noiseSuppressor = null
+        echoCanceler?.release()
+        echoCanceler = null
     }
 
     override fun onInit(status: Int) {
@@ -408,14 +541,14 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
                 textToSpeech?.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         viewModelScope.launch(Dispatchers.Main) {
-                            stopListening()
+                            pauseRecognitionForSpeech()
                         }
                     }
 
                     override fun onDone(utteranceId: String?) {
                         if (utteranceId == "AiResponse") {
                             viewModelScope.launch(Dispatchers.Main) {
-                                startListening()
+                                recognitionPausedForSpeech = false
                             }
                         }
                     }
@@ -605,15 +738,11 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     private fun getReminderSummaryText(): String {
         val list = _remindersList.value
         if (list.isEmpty()) return "ยังไม่มีรายการเตือนค่ะ"
-        val df = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+        val df = SimpleDateFormat("d MMMM yyyy เวลา HH:mm", Locale("th", "TH")).apply {
+            calendar = java.util.Calendar.getInstance(Locale("th", "TH"))
+        }
         return "รายการเตือนทั้งหมดของคุณมีดังนี้ค่ะ:\n" + list.joinToString("\n") { 
-            val kindText = when (it.kind) {
-                "medicine" -> "กินยา"
-                "appointment" -> "นัดหมอ"
-                "vaccine" -> "วัคซีน"
-                else -> "ทั่วไป"
-            }
-            "- ${it.title} ($kindText) เวลา ${df.format(Date(it.triggerAtMillis))}"
+            "- ${it.title} เวลา ${df.format(Date(it.triggerAtMillis))}"
         }
     }
 
@@ -623,7 +752,9 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     private fun getTodayDateText(): String {
-        val df = SimpleDateFormat("EEEEที่ d MMMM yyyy", Locale("th", "TH"))
+        val df = SimpleDateFormat("EEEEที่ d MMMM yyyy", Locale("th", "TH")).apply {
+            calendar = java.util.Calendar.getInstance(Locale("th", "TH"))
+        }
         return "วันนี้คือวัน${df.format(Date())} ค่ะ"
     }
 
@@ -774,8 +905,33 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
                     }
                 }
             },
-            getEmergencyCallResponse = { "อุ่นใจกำลังติดต่อสายฉุกเฉินให้ค่ะ" }
+            getEmergencyCallResponse = { "อุ่นใจกำลังติดต่อสายฉุกเฉินให้ค่ะ" },
+            appVoiceAliases = getAppVoiceAliases(),
+            saveAppVoiceAlias = { alias, packageName -> saveAppVoiceAlias(alias, packageName) }
         )
+    }
+
+    private fun getAppVoiceAliases(): Map<String, String> {
+        val type = object : TypeToken<Map<String, String>>() {}.type
+        val encryptedAliases = behaviorLearningStorage.loadAppVoiceAliases()
+        if (encryptedAliases.isNotEmpty()) return encryptedAliases
+
+        // One-time migration from the older app preference. Existing caregiver
+        // keys remain usable, but all subsequent reads and writes are encrypted.
+        val legacyAliases = runCatching {
+            gson.fromJson<Map<String, String>>(prefs.getString(appVoiceAliasesKey, "{}"), type) ?: emptyMap()
+        }.getOrDefault(emptyMap())
+        if (legacyAliases.isNotEmpty()) {
+            legacyAliases.forEach { (alias, packageName) ->
+                behaviorLearningStorage.saveAppVoiceAlias(alias, packageName)
+            }
+            prefs.edit().remove(appVoiceAliasesKey).apply()
+        }
+        return legacyAliases
+    }
+
+    private fun saveAppVoiceAlias(alias: String, packageName: String) {
+        behaviorLearningStorage.saveAppVoiceAlias(alias, packageName)
     }
 
     private fun getDeviceContacts(): List<Pair<String, String>> {
@@ -898,8 +1054,16 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
 
     @SuppressLint("MissingPermission")
     private fun processUserSpeech(text: String, isFromAdmin: Boolean = false) {
+        if (!isFromAdmin) {
+            // Keep only the recognized text locally and encrypted; never record microphone audio.
+            behaviorLearningStorage.recordRecognizedPhrase(text)
+        }
         val displaySender = if (isFromAdmin) "ผู้ดูแล (Admin)" else "ลูกค้า"
-        _uiState.value = _uiState.value.copy(isListening = false, transcribedText = if (isFromAdmin) "[คำสั่งแอดมิน] $text" else text, aiResponse = "อุ่นใจกำลังคิด...")
+        _uiState.value = _uiState.value.copy(
+            isListening = continuousVoiceSessionEnabled,
+            transcribedText = if (isFromAdmin) "[คำสั่งแอดมิน] $text" else text,
+            aiResponse = "อุ่นใจกำลังคิด..."
+        )
         
         viewModelScope.launch {
             var locationString = "ไม่ทราบตำแหน่ง"
@@ -951,7 +1115,9 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
 
             var appsContext = ""
             if (text.contains("เปิด") || text.contains("แอป") || text.contains("แอพ") || text.contains("เล่น")) {
-                val apps = getInstalledApps().take(80) // Limit to 80 apps to prevent token overflow
+                // Use the complete launcher catalog so every app on this device can be
+                // considered for phonetic voice matching (the current device has 89 apps).
+                val apps = getInstalledApps()
                 if (apps.isNotEmpty()) {
                     appsContext = "[ระบบ: แอปที่ติดตั้งอยู่ในโทรศัพท์เครื่องนี้: " +
                             apps.joinToString(", ") { "${it.first}=${it.second}" } + "]"
@@ -968,13 +1134,28 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
             
             var response = ""
             val apiKeys = getGroqApiKeys()
-            val localResponse = tryLocalCommandFallback(text)
+            val trimmedText = text.trim()
+            val isContactLookup = listOf("ค้นหารายชื่อ", "ค้นหาเบอร์", "หาเบอร์", "หารายชื่อ", "ขอเบอร์", "เบอร์ของ")
+                .any { trimmedText.contains(it) } || trimmedText.startsWith("เบอร์")
+            val requiresLocalHandling = text.contains("ช่วยด้วย") || text.contains("ฉุกเฉิน") ||
+                isContactLookup ||
+                requiresLocalReminderHandling(text) ||
+                // App launches and directions are device actions, not conversational guesses.
+                // Keep them local so similarly named apps (LINE/LINE MAN, etc.) cannot be swapped.
+                listOf("เปิด", "เล่น", "ไป", "พาไป", "นำทาง", "ขอเส้นทาง", "ทางไป", "เส้นทางไป")
+                    .any { trimmedText.contains(it) }
+            val localResponse = if (requiresLocalHandling || apiKeys.isEmpty()) {
+                tryLocalCommandFallback(text)
+            } else {
+                null
+            }
             if (localResponse != null) {
                 response = localResponse
             } else if (apiKeys.isNotEmpty()) {
                 response = repository.getReplyFromNongKanvela(enrichedText, locationString, "", apiKeys)
                 if (response.contains("API ขัดข้อง") || response.isBlank()) {
-                    response = "ขออภัยค่ะ API ขัดข้องในขณะนี้ กรุณาลองใหม่อีกครั้งค่ะ"
+                    response = tryLocalCommandFallback(text)
+                        ?: "ขออภัยค่ะ AI ขัดข้องในขณะนี้ กรุณาลองใหม่อีกครั้งค่ะ"
                 }
             } else {
                 response = "ขออภัยค่ะ อุ่นใจยังไม่รองรับคำถามทั่วไปนี้ หากต้องการคุยกับอุ่นใจแบบอัจฉริยะ กรุณาใส่คีย์ Groq API ในหน้าตั้งค่าบนเครื่องก่อนนะคะ"
@@ -986,13 +1167,19 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
             _conversationHistory.value = currentList
             saveHistoryToDisk(currentList)
             
-            handleAiResponse(response, displaySender)
+            handleAiResponse(response, displaySender, text)
         }
     }
 
-    private fun handleAiResponse(response: String, userSender: String) {
+    private fun handleAiResponse(response: String, userSender: String, spokenText: String) {
         var finalResponse = response
         var actionIntent: Intent? = null
+        var shouldSpeak = true
+
+        if (finalResponse.contains("[SILENT]")) {
+            finalResponse = finalResponse.replace("[SILENT]", "").trim()
+            shouldSpeak = false
+        }
 
         // Check for specific actions requested by the AI
         if (response.contains("[ACTION:CONFIRM_CALL:")) {
@@ -1013,8 +1200,14 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
                 finalResponse = response.substring(0, response.indexOf("[ACTION:OPEN_APP:")) + 
                                 response.substring(endIndex + 1)
                 finalResponse = finalResponse.trim()
-                
                 actionIntent = context.packageManager.getLaunchIntentForPackage(packageName)
+                if (actionIntent == null) {
+                    finalResponse = "ไม่พบแอปที่ระบุในเครื่องค่ะ"
+                } else {
+                    appVoiceAliasFromSpokenCommand(spokenText)?.let { alias ->
+                        saveAppVoiceAlias(alias, packageName)
+                    }
+                }
             }
         } else if (response.contains("[ACTION:FLASHLIGHT_ON]")) {
             finalResponse = response.replace("[ACTION:FLASHLIGHT_ON]", "").trim()
@@ -1038,6 +1231,96 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
             finalResponse = response.replace("[ACTION:CAMERA]", "").trim()
             actionIntent = Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else if (response.contains("[ACTION:TAKE_PHOTO]")) {
+            finalResponse = response.replace("[ACTION:TAKE_PHOTO]", "").trim()
+            actionIntent = Intent(context, CameraCaptureActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else if (response.contains("[ACTION:OPEN_MAPS]")) {
+            finalResponse = response.replace("[ACTION:OPEN_MAPS]", "").trim()
+            actionIntent = Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=")).apply {
+                setPackage("com.google.android.apps.maps")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else if (response.contains("[ACTION:NAVIGATE:") || response.contains("[ACTION:MAP_SEARCH:") || response.contains("[ACTION:MAP_NEARBY:")) {
+            val prefix = listOf("[ACTION:NAVIGATE:", "[ACTION:MAP_SEARCH:", "[ACTION:MAP_NEARBY:")
+                .first { response.contains(it) }
+            val startIndex = response.indexOf(prefix) + prefix.length
+            val endIndex = response.indexOf("]", startIndex)
+            if (endIndex > startIndex) {
+                val query = response.substring(startIndex, endIndex).trim()
+                finalResponse = (response.substring(0, response.indexOf(prefix)) + response.substring(endIndex + 1)).trim()
+                val uri = if (prefix == "[ACTION:NAVIGATE:") {
+                    Uri.parse("google.navigation:q=${Uri.encode(query)}")
+                } else {
+                    Uri.parse("geo:0,0?q=${Uri.encode(query)}")
+                }
+                actionIntent = Intent(Intent.ACTION_VIEW, uri).apply {
+                    // Never let a generic navigation intent be claimed by Grab, Zoom, or another app.
+                    setPackage("com.google.android.apps.maps")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+        } else if (response.contains("[ACTION:WEB_SEARCH:") || response.contains("[ACTION:SEARCH_IMAGE:") || response.contains("[ACTION:SEARCH_YOUTUBE:")) {
+            val prefix = listOf("[ACTION:WEB_SEARCH:", "[ACTION:SEARCH_IMAGE:", "[ACTION:SEARCH_YOUTUBE:")
+                .first { response.contains(it) }
+            val startIndex = response.indexOf(prefix) + prefix.length
+            val endIndex = response.indexOf("]", startIndex)
+            if (endIndex > startIndex) {
+                val query = response.substring(startIndex, endIndex).trim()
+                finalResponse = (response.substring(0, response.indexOf(prefix)) + response.substring(endIndex + 1)).trim()
+                val url = when (prefix) {
+                    "[ACTION:SEARCH_IMAGE:" -> "https://www.google.com/search?tbm=isch&q=${Uri.encode(query)}"
+                    "[ACTION:SEARCH_YOUTUBE:" -> "https://www.youtube.com/results?search_query=${Uri.encode(query)}"
+                    else -> "https://www.google.com/search?q=${Uri.encode(query)}"
+                }
+                actionIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+        } else if (response.contains("[ACTION:SET_TIMER:")) {
+            val startIndex = response.indexOf("[ACTION:SET_TIMER:") + 18
+            val endIndex = response.indexOf("]", startIndex)
+            val seconds = if (endIndex > startIndex) response.substring(startIndex, endIndex).trim().toIntOrNull() else null
+            if (seconds != null && seconds > 0) {
+                finalResponse = (response.substring(0, response.indexOf("[ACTION:SET_TIMER:")) + response.substring(endIndex + 1)).trim()
+                actionIntent = Intent(android.provider.AlarmClock.ACTION_SET_TIMER).apply {
+                    putExtra(android.provider.AlarmClock.EXTRA_LENGTH, seconds)
+                    putExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, true)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+        } else if (response.contains("[ACTION:OPEN_WIFI_SETTINGS]") || response.contains("[ACTION:OPEN_BLUETOOTH_SETTINGS]") ||
+            response.contains("[ACTION:OPEN_SOUND_SETTINGS]") || response.contains("[ACTION:OPEN_DISPLAY_SETTINGS]") || response.contains("[ACTION:OPEN_SETTINGS]")) {
+            val (tag, settingsAction) = when {
+                response.contains("[ACTION:OPEN_WIFI_SETTINGS]") -> "[ACTION:OPEN_WIFI_SETTINGS]" to android.provider.Settings.ACTION_WIFI_SETTINGS
+                response.contains("[ACTION:OPEN_BLUETOOTH_SETTINGS]") -> "[ACTION:OPEN_BLUETOOTH_SETTINGS]" to android.provider.Settings.ACTION_BLUETOOTH_SETTINGS
+                response.contains("[ACTION:OPEN_SOUND_SETTINGS]") -> "[ACTION:OPEN_SOUND_SETTINGS]" to android.provider.Settings.ACTION_SOUND_SETTINGS
+                response.contains("[ACTION:OPEN_DISPLAY_SETTINGS]") -> "[ACTION:OPEN_DISPLAY_SETTINGS]" to android.provider.Settings.ACTION_DISPLAY_SETTINGS
+                else -> "[ACTION:OPEN_SETTINGS]" to android.provider.Settings.ACTION_SETTINGS
+            }
+            finalResponse = response.replace(tag, "").trim()
+            actionIntent = Intent(settingsAction).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        } else if (response.contains("[ACTION:BLUETOOTH_ON]") || response.contains("[ACTION:BLUETOOTH_OFF]")) {
+            val tag = if (response.contains("[ACTION:BLUETOOTH_ON]")) "[ACTION:BLUETOOTH_ON]" else "[ACTION:BLUETOOTH_OFF]"
+            finalResponse = response.replace(tag, "").trim()
+            actionIntent = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else if (response.contains("[ACTION:SEND_SMS:")) {
+            val prefix = "[ACTION:SEND_SMS:"
+            val startIndex = response.indexOf(prefix) + prefix.length
+            val endIndex = response.indexOf("]", startIndex)
+            if (endIndex > startIndex) {
+                val parts = response.substring(startIndex, endIndex).split(":", limit = 2)
+                if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+                    finalResponse = (response.substring(0, response.indexOf(prefix)) + response.substring(endIndex + 1)).trim()
+                    actionIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${parts[0].trim()}")) .apply {
+                        putExtra("sms_body", parts[1].trim())
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                }
             }
         } else if (response.contains("[ACTION:CALL:")) {
             // Extract the phone number, e.g. [ACTION:CALL:0812345678]
@@ -1148,6 +1431,9 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
                     }
                 }
             }
+        } else if (response.contains("[ACTION:CANCEL_ALL_REMINDERS]")) {
+            finalResponse = response.replace("[ACTION:CANCEL_ALL_REMINDERS]", "").trim()
+            cancelAllAppReminders()
         } else if (response.contains("[ACTION:ASK_CLARIFICATION:")) {
             val startIndex = response.indexOf("[ACTION:ASK_CLARIFICATION:")
             val endIndex = response.indexOf("]", startIndex)
@@ -1159,6 +1445,18 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
             finalResponse = response.replace("[ACTION:IMPORT_CONTACTS_FROM_SHEET]", "").trim()
         }
 
+        // ACTION markers are internal instructions. Known ones are handled above, and this
+        // final pass prevents an unknown or malformed marker from being shown or spoken.
+        finalResponse = hideInternalActionMarkers(finalResponse)
+        if (finalResponse.isBlank()) {
+            finalResponse = "ขออภัยค่ะ คำสั่งนี้ยังทำไม่ได้ค่ะ"
+        }
+
+        if (actionIntent != null) {
+            // The user is leaving this assistant for another Android activity; do not
+            // retain microphone capture or restart listening behind that app.
+            stopListeningForExternalAction()
+        }
         _uiState.value = _uiState.value.copy(aiResponse = finalResponse, actionIntent = actionIntent)
         
         // Record AI Message
@@ -1174,7 +1472,29 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
         sendGoogleSheetMessage(lastUserMessage, finalResponse, lastLocation)
         
         // Speak the response
-        textToSpeech?.speak(finalResponse, TextToSpeech.QUEUE_FLUSH, null, "AiResponse")
+        if (shouldSpeak) {
+            textToSpeech?.speak(com.example.nongkanvelaassistant.data.ThaiSpeechText.expandRanks(finalResponse), TextToSpeech.QUEUE_FLUSH, null, "AiResponse")
+        } else {
+            recognitionPausedForSpeech = false
+        }
+    }
+
+    private fun appVoiceAliasFromSpokenCommand(text: String): String? {
+        if (!listOf("เปิด", "เล่น", "แอป", "แอพ").any(text::contains)) return null
+        val alias = text.trim()
+            .replace("เปิดแอป", "")
+            .replace("เปิดแอพ", "")
+            .replace("เปิด", "")
+            .replace("เล่น", "")
+            .replace("อุ่นใจ", "")
+            .replace("น้องกาลเวลา", "")
+            .replace("น้องกัลเวลา", "")
+            .replace("แอป", "")
+            .replace("แอพ", "")
+            .replace("ให้หน่อย", "")
+            .replace("หน่อย", "")
+            .trim()
+        return alias.takeIf { it.isNotBlank() }
     }
 
     fun clearActionIntent() {
@@ -1189,6 +1509,9 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     override fun onEndOfSpeech() {}
     
     override fun onError(error: Int) {
+        stopNoiseReducedAudioSource()
+        if (recognitionPausedForSpeech) return
+        continuousVoiceSessionEnabled = false
         // Silence is normal for an elderly-friendly voice UI; do not show technical errors.
         val gentleMessage = when (error) {
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "กรุณาอนุญาตการใช้ไมโครโฟนก่อนนะคะ"
@@ -1204,9 +1527,21 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     override fun onResults(results: Bundle?) {
+        stopNoiseReducedAudioSource()
+        continuousVoiceSessionEnabled = false
+        recognitionPausedForSpeech = false
         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         if (!matches.isNullOrEmpty()) {
-            processUserSpeech(matches[0])
+            val text = matches[0].trim()
+            if (text.replace(Regex("\\s+"), "").let { it == "หยุดฟัง" || it == "เลิกฟัง" || it == "ปิดไมค์" }) {
+                stopListening()
+                _uiState.value = _uiState.value.copy(aiResponse = "หยุดฟังแล้วค่ะ")
+            } else {
+                _uiState.value = _uiState.value.copy(isListening = false)
+                processUserSpeech(text)
+            }
+        } else {
+            _uiState.value = _uiState.value.copy(isListening = false, transcribedText = "")
         }
     }
 
@@ -1214,11 +1549,26 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     override fun onEvent(eventType: Int, params: Bundle?) {}
 
     override fun onCleared() {
+        recognitionHandler.removeCallbacksAndMessages(null)
+        stopNoiseReducedAudioSource()
         speechRecognizer?.destroy()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         super.onCleared()
     }
+}
+
+internal fun hideInternalActionMarkers(text: String): String =
+    text.replace(Regex("""\s*\[ACTION:[^\]\r\n]*(?:\]|\z)"""), "")
+        .replace(Regex("""\s{2,}"""), " ")
+        .trim()
+
+internal fun requiresLocalReminderHandling(text: String): Boolean {
+    val normalized = text.replace(Regex("""\s+"""), "").lowercase()
+    return listOf(
+        "เตือน", "แจ้งเตือน", "รายการเตือน", "นาฬิกาปลุก", "ตั้งปลุก", "ปลุก",
+        "นัดหมอ", "หมอนัด", "ใบนัด", "วันนัด", "รายการนัด"
+    ).any(normalized::contains)
 }
 
 data class VoiceAssistantState(

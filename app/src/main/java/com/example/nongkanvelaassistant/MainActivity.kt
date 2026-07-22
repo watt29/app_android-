@@ -137,7 +137,7 @@ class MainActivity : ComponentActivity() {
         
         setupBatteryAndShutdownMonitor()
         setupNetworkMonitor()
-        ContextCompat.startForegroundService(this, Intent(this, EmergencyService::class.java))
+        startEmergencyServiceIfLocationAllowed()
 
         setContent {
             NongKanvelaAssistantTheme {
@@ -178,6 +178,12 @@ class MainActivity : ComponentActivity() {
             viewModel.startListening()
         } else {
             requestPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+        }
+    }
+
+    private fun startEmergencyServiceIfLocationAllowed() {
+        if (EmergencyService.hasLocationPermission(this)) {
+            ContextCompat.startForegroundService(this, Intent(this, EmergencyService::class.java))
         }
     }
 
@@ -303,13 +309,14 @@ fun VoiceAssistantScreen(
     val accentNeon = Color(0xFF00D9FF)
     val errorColor = Color(0xFFEF5350)
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(bgDark)
-            .padding(horizontal = 38.dp, vertical = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(bgDark)
+                .padding(horizontal = 38.dp, vertical = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -334,11 +341,13 @@ fun VoiceAssistantScreen(
                     fontWeight = FontWeight.Medium,
                 )
             }
-            IconButton(
-                onClick = { showSettingsDialog = true },
-                modifier = Modifier.size(52.dp)
-            ) {
-                Text("⚙️", fontSize = 28.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = { showSettingsDialog = true },
+                    modifier = Modifier.size(52.dp)
+                ) {
+                    Text("⚙️", fontSize = 28.sp)
+                }
             }
         }
 
@@ -461,6 +470,8 @@ fun VoiceAssistantScreen(
         }
         
         Spacer(modifier = Modifier.height(8.dp))
+    }
+    
     }
 
     if (showSettingsDialog) {

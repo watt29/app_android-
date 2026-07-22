@@ -103,10 +103,10 @@ class NongKanvelaInCallService : InCallService(), TextToSpeech.OnInitListener {
     private fun speakIncomingCaller(callerName: String) {
         if (callerName.any { it in 'A'..'Z' || it in 'a'..'z' }) {
             speakThai("สายจาก", TextToSpeech.QUEUE_FLUSH)
-            speakEnglish(callerName)
+            speakEnglish(com.example.nongkanvelaassistant.data.ThaiSpeechText.expandRanks(callerName))
             speakThai("กำลังโทรมาค่ะ", TextToSpeech.QUEUE_ADD)
         } else {
-            speakThai("สายจาก $callerName กำลังโทรมาค่ะ", TextToSpeech.QUEUE_FLUSH)
+            speakThai(com.example.nongkanvelaassistant.data.ThaiSpeechText.expandRanks("สายจาก $callerName กำลังโทรมาค่ะ"), TextToSpeech.QUEUE_FLUSH)
         }
     }
 

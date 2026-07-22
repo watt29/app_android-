@@ -6,8 +6,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
-import android.media.MediaPlayer
-import android.media.RingtoneManager
+import android.media.ToneGenerator
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -110,35 +110,7 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
             wakeLock.acquire(35000)
             Log.i("ReminderAlarmReceiver", "WakeLock acquired successfully")
 
-            // Play siren/alarm sound for 3 seconds
-            var mediaPlayer: MediaPlayer? = null
-            try {
-                val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                    ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                Log.i("ReminderAlarmReceiver", "Playing alarm sound from Uri: $alarmUri")
-                mediaPlayer = MediaPlayer().apply {
-                    setDataSource(context, alarmUri)
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ALARM)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
-                    isLooping = false
-                    prepare()
-                    start()
-                }
-                delay(3000) // Play siren for 3 seconds
-            } catch (e: Exception) {
-                Log.e("ReminderAlarmReceiver", "Error playing alarm sound", e)
-            } finally {
-                try {
-                    mediaPlayer?.stop()
-                    mediaPlayer?.release()
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
+            playThreeBeeps()
 
             // Speak using TextToSpeech (Repeat 2 times with 3 seconds delay in between)
             for (i in 1..3) {
@@ -152,6 +124,18 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
             if (wakeLock.isHeld) {
                 wakeLock.release()
             }
+        }
+    }
+
+    private suspend fun playThreeBeeps() {
+        val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        try {
+            repeat(3) { index ->
+                tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 280)
+                delay(if (index == 2) 280 else 460)
+            }
+        } finally {
+            tone.release()
         }
     }
 

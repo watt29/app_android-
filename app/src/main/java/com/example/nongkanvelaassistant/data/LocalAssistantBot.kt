@@ -11,6 +11,28 @@ import java.util.Locale
 class LocalAssistantBot {
     companion object {
         private const val SELF_APP_PACKAGE = "com.example.nongkanvelaassistant"
+        /**
+         * Portable starter catalog. It contains package identities, not one
+         * person's installed-app list; every entry is still checked against the
+         * current phone's launcher apps before anything is opened.
+         */
+        private val STANDARD_APP_VOICE_PACKAGES = mapOf(
+            "grab" to "com.grabtaxi.passenger",
+            "zoom" to "us.zoom.videomeetings",
+            "facebook" to "com.facebook.katana",
+            "messenger" to "com.facebook.orca",
+            "shopee" to "com.shopee.th",
+            "lazada" to "com.lazada.android",
+            "tiktok" to "com.zhiliaoapp.musically",
+            "youtube" to "com.google.android.youtube",
+            "chrome" to "com.android.chrome",
+            "gmail" to "com.google.android.gm",
+            "kplus" to "com.kasikorn.retail.mbanking.wap",
+            "scbeasy" to "com.scb.phone",
+            "truemoney" to "th.co.truemoney.wallet",
+            "paotang" to "com.krungthai.paotang",
+            "myais" to "com.ais.mimo.eservice"
+        )
         val DELETE_REMINDER_PREFIXES = listOf(
             "ลบเตือน", "ยกเลิกเตือน", "ลบรายการเตือน", "ยกเลิกรายการเตือน",
             "ลบการเตือน", "ยกเลิกการเตือน", "ลบตัวเตือน",
@@ -160,7 +182,9 @@ class LocalAssistantBot {
         getReminderSummaryText: () -> String = { "ยังไม่มีรายการเตือนค่ะ" },
         removeReminderByQuery: (String) -> String? = { null },
         consumePendingConfirmation: (String) -> String?,
-        getEmergencyCallResponse: () -> String
+        getEmergencyCallResponse: () -> String,
+        appVoiceAliases: Map<String, String> = emptyMap(),
+        saveAppVoiceAlias: (String, String) -> Unit = { _, _ -> }
     ): String? {
         val cleanText = text.trim()
         if (cleanText.isBlank()) return null
@@ -173,6 +197,7 @@ class LocalAssistantBot {
         handleBatteryCommand(canonicalText, getBatteryStatus)?.let { return it }
         handleDutyCommand(canonicalText)?.let { return it }
         handleTimeDateCommand(canonicalText, getCurrentTimeText, getTodayDateText, getDateAnswerText)?.let { return it }
+        handleControlVerbFirst(canonicalText)?.let { return it }
         handleReminderDeleteCommand(canonicalText, removeReminderByQuery)?.let { return it }
         handleReminderSummaryCommand(canonicalText, getReminderSummaryText)?.let { return it }
         handleReminderCommand(canonicalText)?.let { return it }
@@ -195,10 +220,61 @@ class LocalAssistantBot {
         handleCallCommand(canonicalText, contacts, scamNumbers)?.let { return it }
         handleFlashlightCommand(canonicalText)?.let { return it }
         handleCameraCommand(canonicalText)?.let { return it }
-        handleOpenAppCommand(canonicalText, apps)?.let { return it }
+        handleAppVoiceAliasCommand(canonicalText, apps, saveAppVoiceAlias)?.let { return it }
+        handleOpenAppCommand(canonicalText, apps, appVoiceAliases, saveAppVoiceAlias)?.let { return it }
         handleContentPreferenceCommand(canonicalText, contentPreferences)?.let { return it }
         handleVagueOptionsQuestion(canonicalText)?.let { return it }
         handleChitchat(canonicalText)?.let { return it }
+
+        return null
+    }
+
+    /**
+     * Control verbs must run before intent-specific parsers. In particular, a close/cancel
+     * command must never reach the alarm or reminder creation path.
+     */
+    private fun handleControlVerbFirst(text: String): String? {
+        val compacted = compactWhitespace(text)
+        val isCancel = listOf("ปิด", "ยกเลิก", "ลบ", "หยุด").any { compacted.contains(it) }
+        val isOpen = compacted.contains("เปิด")
+        val isAll = listOf("ทุกเวลา", "ทั้งหมด", "ทุกอัน", "ทุกรายการ").any { compacted.contains(it) }
+        val isScheduledThing = listOf("นาฬิกาปลุก", "ปลุก", "เตือน", "แจ้งเตือน", "ตั้งเวลา", "จับเวลา")
+            .any { compacted.contains(it) }
+
+        if (isCancel && isScheduledThing) {
+            return if (isAll) {
+                "[ACTION:CANCEL_ALL_REMINDERS] ปิดรายการเตือนของอุ่นใจทั้งหมดแล้วค่ะ"
+            } else if (DELETE_REMINDER_PREFIXES.any { compacted.startsWith(it) }) {
+                // Let the existing deletion parser resolve the named reminder.
+                null
+            } else {
+                "บอกชื่อหรือเวลารายการที่ต้องการปิดเพิ่มอีกนิดนะคะ"
+            }
+        }
+
+        if (compacted.contains("ไฟฉาย")) {
+            return when {
+                isOpen -> "[ACTION:FLASHLIGHT_ON] เปิดไฟฉายให้แล้วค่ะ"
+                isCancel -> "[ACTION:FLASHLIGHT_OFF] ปิดไฟฉายให้แล้วค่ะ"
+                else -> null
+            }
+        }
+
+        if (compacted.contains("บลูทูธ") || compacted.contains("bluetooth")) {
+            return if (isOpen || isCancel) {
+                "[ACTION:OPEN_BLUETOOTH_SETTINGS] เปิดหน้าบลูทูธให้ค่ะ"
+            } else {
+                null
+            }
+        }
+
+        if (compacted.contains("ไวไฟ") || compacted.contains("wifi")) {
+            return if (isOpen || isCancel) {
+                "[ACTION:OPEN_WIFI_SETTINGS] เปิดหน้าตั้งค่า Wi-Fi ให้ค่ะ"
+            } else {
+                null
+            }
+        }
 
         return null
     }
@@ -572,9 +648,19 @@ class LocalAssistantBot {
     private fun handleAlarmCommand(text: String): String? {
         if (!(text.contains("ปลุก") || text.contains("นาฬิกาปลุก"))) return null
 
+        val isTurningOff = listOf("ปิด", "ยกเลิก", "ลบ", "หยุด").any { text.contains(it) }
+        val isAllAlarms = listOf("ทุกเวลา", "ทั้งหมด", "ทุกอัน", "ทุกรายการ").any { text.contains(it) }
+        if (isTurningOff && isAllAlarms) {
+            return "[ACTION:CANCEL_ALL_REMINDERS] ปิดรายการเตือนของอุ่นใจทั้งหมดแล้วค่ะ"
+        }
+
+        if (isTurningOff) {
+            return "บอกชื่อหรือเวลานาฬิกาปลุกที่ต้องการปิดเพิ่มอีกนิดนะคะ"
+        }
+
         // 1. Try our new Thai time parser
         parseThaiTime(text)?.let { (hour, minute) ->
-            return "[ACTION:SET_ALARM:$hour:$minute] ตั้งปลุกเวลา ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} ให้แล้วค่ะ"
+            return buildAlarmReminderAction(hour, minute)
         }
 
         // 2. Fall back to digits hh:mm pattern
@@ -583,7 +669,7 @@ class LocalAssistantBot {
             val hour = match.groupValues[1].toIntOrNull() ?: return null
             val minute = match.groupValues[2].toIntOrNull() ?: return null
             if (hour in 0..23 && minute in 0..59) {
-                return "[ACTION:SET_ALARM:$hour:$minute] ตั้งปลุกเวลา ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} ให้แล้วค่ะ"
+                return buildAlarmReminderAction(hour, minute)
             }
         }
 
@@ -593,11 +679,29 @@ class LocalAssistantBot {
             val hour = match.groupValues[1].toIntOrNull() ?: return null
             val minute = match.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
             if (hour in 0..23 && minute in 0..59) {
-                return "[ACTION:SET_ALARM:$hour:$minute] ตั้งปลุกเวลา ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} ให้แล้วค่ะ"
+                return buildAlarmReminderAction(hour, minute)
             }
         }
 
         return "กรุณาบอกเวลาที่ต้องการตั้งปลุกด้วยค่ะ เช่น ตั้งปลุก 6 โมง หรือ ตั้งปลุก 06:30 ค่ะ"
+    }
+
+    private fun buildAlarmReminderAction(hour: Int, minute: Int): String {
+        val trigger = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, hour)
+            set(Calendar.MINUTE, minute)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis <= System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
+        }
+        val title = "นาฬิกาปลุก"
+        val encodedTitle = try {
+            URLEncoder.encode(title, "UTF-8")
+        } catch (_: Exception) {
+            title
+        }
+        val formattedTime = "${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}"
+        return "[ACTION:SET_REMINDER:general|0|${trigger.timeInMillis}|$encodedTitle] ตั้งปลุกเวลา $formattedTime ให้แล้วค่ะ"
     }
 
     private fun handleReminderCommand(text: String): String? {
@@ -697,7 +801,12 @@ class LocalAssistantBot {
             text.contains("เตือนอะไร") ||
             text.contains("ดูเตือน") ||
             text.contains("เตือนที่ตั้งไว้") ||
-            text.contains("เตือนทั้งหมด")
+            text.contains("เตือนทั้งหมด") ||
+            text.contains("มีเตือน") ||
+            text.contains("เตือนบ้าง") ||
+            text.contains("รายการนัด") ||
+            text.contains("มีนัด") ||
+            text.contains("นัดอะไรบ้าง")
         ) {
             getReminderSummaryText()
         } else {
@@ -1098,9 +1207,9 @@ class LocalAssistantBot {
             cleanText.contains("เปิดไวไฟ") || cleanText.contains("ตั้งค่าไวไฟ") || normalizedText.contains("เปิด wifi") || normalizedText.contains("ตั้งค่า wifi") || cleanText.contains("หน้าไวไฟ") ->
                 "[ACTION:OPEN_WIFI_SETTINGS] กำลังเปิดหน้าตั้งค่า Wi-Fi ให้ค่ะ"
             cleanText.contains("เปิดบลูทูธ") || normalizedText.contains("เปิด bluetooth") ->
-                "[ACTION:BLUETOOTH_ON] กำลังขอเปิด Bluetooth ให้ค่ะ"
+                "[ACTION:BLUETOOTH_ON] เปิดหน้าบลูทูธให้ค่ะ กรุณาเปิดสวิตช์บนหน้าจอนี้นะคะ"
             cleanText.contains("ปิดบลูทูธ") || normalizedText.contains("ปิด bluetooth") ->
-                "[ACTION:BLUETOOTH_OFF] กำลังปิด Bluetooth ให้ค่ะ"
+                "[ACTION:BLUETOOTH_OFF] เปิดหน้าบลูทูธให้ค่ะ กรุณาปิดสวิตช์บนหน้าจอนี้นะคะ"
             cleanText.contains("ตั้งค่าบลูทูธ") || normalizedText.contains("ตั้งค่า bluetooth") || cleanText.contains("หน้าบลูทูธ") ->
                 "[ACTION:OPEN_BLUETOOTH_SETTINGS] กำลังเปิดหน้าตั้งค่า Bluetooth ให้ค่ะ"
             cleanText.contains("ตั้งค่าเสียง") || cleanText.contains("เปิดตั้งค่าเสียง") || cleanText.contains("หน้าตั้งค่าเสียง") ->
@@ -1177,7 +1286,7 @@ class LocalAssistantBot {
         val message = match.groupValues[2].trim()
         val matchedContact = findBestMatchingContact(targetName, contacts)
             ?: return "ไม่พบรายชื่อ $targetName ในโทรศัพท์ค่ะ"
-        return "[ACTION:SEND_SMS:${matchedContact.number}:${message}] กำลังส่งข้อความหา ${matchedContact.name} ให้ค่ะ"
+        return "[ACTION:SEND_SMS:${matchedContact.number}:${message}] เปิดหน้าส่งข้อความหา ${matchedContact.name} ให้ค่ะ"
     }
 
     private fun handleReadMessageCommand(text: String, readLatestMessage: () -> String): String? {
@@ -1238,7 +1347,29 @@ class LocalAssistantBot {
         return "[ACTION:CALL:${matchedContact.number}] อุ่นใจกำลังต่อสายโทรออกหา${matchedContact.name}ให้ค่ะ"
     }
 
-    private fun handleOpenAppCommand(text: String, apps: List<Pair<String, String>>): String? {
+    private fun handleAppVoiceAliasCommand(
+        text: String,
+        apps: List<Pair<String, String>>,
+        saveAppVoiceAlias: (String, String) -> Unit
+    ): String? {
+        val match = Regex("^(?:เรียกแอป|ตั้งชื่อแอป|จำชื่อแอป)\\s+(.+?)\\s+(?:ว่า|เป็น)\\s+(.+)$").find(text)
+            ?: return null
+        val appName = match.groupValues[1].trim()
+        val alias = match.groupValues[2].trim()
+        if (alias.isBlank()) return "กรุณาบอกชื่อสั้นที่ต้องการเรียกด้วยค่ะ"
+        val app = findBestMatchingApp(appName, apps)
+            ?: apps.firstOrNull { normalizeAppName(it.first) == normalizeAppName(appName) }
+            ?: return "ไม่พบแอป $appName ในเครื่องค่ะ"
+        saveAppVoiceAlias(alias, app.second)
+        return "จำแล้วค่ะ ต่อไปพูดว่า เปิด$alias ได้เลยค่ะ"
+    }
+
+    private fun handleOpenAppCommand(
+        text: String,
+        apps: List<Pair<String, String>>,
+        appVoiceAliases: Map<String, String>,
+        saveAppVoiceAlias: (String, String) -> Unit
+    ): String? {
         val cleanText = text.trim()
         
         // 1. Check for generalized music keywords first
@@ -1271,6 +1402,9 @@ class LocalAssistantBot {
             .replace("เปิดแอพ", "")
             .replace("เปิด", "")
             .replace("เล่น", "")
+            .replace("อุ่นใจ", "")
+            .replace("น้องกาลเวลา", "")
+            .replace("น้องกัลเวลา", "")
             .replace("แอป", "")
             .replace("แอพ", "")
             .replace("ให้หน่อย", "")
@@ -1278,8 +1412,6 @@ class LocalAssistantBot {
             .trim()
 
         if (targetAppName.isBlank()) return null
-
-        findAmbiguousAppIntent(targetAppName, apps)?.let { return it }
 
         if (normalizeAppName(targetAppName).contains("อุ่นใจ") ||
             normalizeAppName(targetAppName).contains("nongkanvela") ||
@@ -1292,9 +1424,66 @@ class LocalAssistantBot {
             return "[ACTION:OPEN_MAPS] กำลังเปิด GPS ให้ค่ะ"
         }
 
-        val matchedApp = findBestMatchingApp(targetAppName, apps)
-            ?: return "ไม่พบแอป $targetAppName ในเครื่องค่ะ"
+        // An exact spoken app name is decisive.  For example, "เปิดไลน์" must
+        // open LINE even if LINE MAN is installed; only genuinely inexact names
+        // are allowed to fall through to a clarification.
+        val normalizedTarget = normalizeAppName(targetAppName)
+        appVoiceAliases.entries.firstOrNull { normalizeAppName(it.key) == normalizedTarget }
+            ?.value
+            ?.let { packageName ->
+                apps.firstOrNull { it.second == packageName }?.let { matchedApp ->
+                    return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+                }
+            }
+        STANDARD_APP_VOICE_PACKAGES[normalizedTarget]?.let { packageName ->
+            apps.firstOrNull { it.second == packageName }?.let { matchedApp ->
+                saveAppVoiceAlias(targetAppName, matchedApp.second)
+                return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+            }
+        }
+        if (normalizedTarget == "line") {
+            // Use LINE's package identity, not the launcher label.  Some phones
+            // expose labels such as "LINE Official", while LINE MAN also begins
+            // with the word LINE.
+            findBestMatchingApp("line", apps)?.let { matchedApp ->
+                saveAppVoiceAlias(targetAppName, matchedApp.second)
+                return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+            }
+        }
+        if (normalizedTarget in setOf("7", "7eleven", "seveneleven", "seven")) {
+            apps.firstOrNull { it.second == "asuk.com.android.app" }?.let { matchedApp ->
+                saveAppVoiceAlias(targetAppName, matchedApp.second)
+                return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+            }
+        }
+        if (normalizedTarget in setOf("next", "ktb", "krungthai")) {
+            apps.firstOrNull { it.second == "ktbcs.netbank" }?.let { matchedApp ->
+                saveAppVoiceAlias(targetAppName, matchedApp.second)
+                return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+            }
+        }
+        // Bitkub is commonly recognized as Thai phonetics such as "บิทคับ".
+        // Bind those forms to the package identity, never an AI guess.
+        if (normalizedTarget in setOf("bitkub", "bitcub", "bitcup", "บิทคับ", "บิตคับ", "บิทคาบ")) {
+            apps.firstOrNull { it.second == "com.bitkub" }?.let { matchedApp ->
+                saveAppVoiceAlias(targetAppName, matchedApp.second)
+                return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+            }
+        }
+        apps.firstOrNull { normalizeAppName(it.first) == normalizedTarget }?.let { matchedApp ->
+            saveAppVoiceAlias(targetAppName, matchedApp.second)
+            return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
+        }
 
+        findAmbiguousAppIntent(targetAppName, apps)?.let { return it }
+
+        val matchedApp = findBestMatchingApp(targetAppName, apps)
+            // Let the AI compare a Thai pronunciation against the complete launcher-app
+            // list when deterministic local aliases do not know this particular app.
+            // The UI layer still verifies the returned package can actually launch.
+            ?: return null
+
+        saveAppVoiceAlias(targetAppName, matchedApp.second)
         return "[ACTION:OPEN_APP:${matchedApp.second}] กำลังเปิดแอป ${matchedApp.first} ให้ค่ะ"
     }
 
@@ -1585,12 +1774,10 @@ class LocalAssistantBot {
 
     private fun formatContactSearchResponse(results: List<DeviceContact>): String {
         if (results.isEmpty()) return "ไม่พบรายชื่อนี้ในโทรศัพท์ค่ะ"
-        val topResults = results.take(3)
-        return if (topResults.size == 1) {
-            "พบรายชื่อ ${topResults.first().name} เบอร์ ${cleanPhoneNumber(topResults.first().number)} ค่ะ"
-        } else {
-            "พบหลายรายชื่อที่ตรงกัน ${topResults.joinToString(" / ") { "${it.name} ${cleanPhoneNumber(it.number)}" }} ค่ะ"
-        }
+        val topResults = results.take(5)
+        return "[SILENT]รายชื่อที่พบ\n" + topResults.mapIndexed { index, contact ->
+            "${index + 1}. ${contact.name}\n   ${cleanPhoneNumber(contact.number)}"
+        }.joinToString("\n")
     }
 
     private fun extractTargetName(text: String, prefixes: List<String>): String {
@@ -1695,6 +1882,10 @@ class LocalAssistantBot {
             "แชท gpt" to "chatgpt",
             "แชต gpt" to "chatgpt",
             "ลาย" to "line",
+            // Must run before the general "คับ" -> "ครับ" correction below.
+            "บิทคับ" to "bitkub",
+            "บิตคับ" to "bitkub",
+            "บิทคาบ" to "bitkub",
             "กูเกิลแมปนำทาง" to "นำทาง google map",
             "เซเว้น" to "เซเว่น",
             "เซเวน" to "เซเว่น",
@@ -1836,6 +2027,41 @@ class LocalAssistantBot {
 
     private fun normalizeAppName(value: String): String {
         return value.lowercase(Locale.ROOT)
+            // Thai speech recognition commonly returns the 7-Eleven name in Thai,
+            // not its written Latin brand name.
+            .replace("เซเว่น อีเลฟเว่น", "7eleven")
+            .replace("เซเว่นอีเลฟเว่น", "7eleven")
+            .replace("เซเว่นอิเลฟเว่น", "7eleven")
+            .replace("เซเว่นอีเลเว่น", "7eleven")
+            .replace("เจ็ดอีเลฟเว่น", "7eleven")
+            .replace("7 eleven", "7eleven")
+            .replace("7-eleven", "7eleven")
+            .replace("กรุงไทยเน็กซ์", "next")
+            .replace("กรุงไทย next", "next")
+            .replace("กรุงไทย", "ktb")
+            .replace("เคทีบี", "ktb")
+            .replace("เคที บี", "ktb")
+            .replace("เน็กซ์", "next")
+            .replace("บิทคับ", "bitkub")
+            .replace("บิตคับ", "bitkub")
+            .replace("บิทคาบ", "bitkub")
+            .replace("แกร็บ", "grab")
+            .replace("ซูม", "zoom")
+            .replace("เมสเซนเจอร์", "messenger")
+            .replace("เมสเซ็นเจอร์", "messenger")
+            .replace("ช้อปปี้", "shopee")
+            .replace("ลาซาด้า", "lazada")
+            .replace("ติ๊กต็อก", "tiktok")
+            .replace("ติกต็อก", "tiktok")
+            .replace("โครม", "chrome")
+            .replace("จีเมล", "gmail")
+            .replace("เคพลัส", "kplus")
+            .replace("กสิกร", "kplus")
+            .replace("เอสซีบี", "scbeasy")
+            .replace("ไทยพาณิชย์", "scbeasy")
+            .replace("ทรูมันนี่", "truemoney")
+            .replace("เป๋าตัง", "paotang")
+            .replace("มายเอไอเอส", "myais")
             .replace("ไลน์แมน", "lineman")
             .replace("ไลน์", "line")
             .replace("ลาย", "line")
@@ -2099,18 +2325,15 @@ class LocalAssistantBot {
             }
         }
 
+        // App names must match exactly (or use one of the explicit aliases above).  A broad
+        // substring match is unsafe here: "LINE" can otherwise select LINE MAN and a
+        // transcription error can launch an unrelated application.
         return apps
             .map { app ->
                 val normalizedAppName = normalizeAppName(app.first)
                 val score = when {
                     normalizedAppName == normalizedTarget -> 500
                     app.second.equals(normalizedTarget, ignoreCase = true) -> 450
-                    app.second.contains(normalizedTarget, ignoreCase = true) -> 350
-                    normalizedAppName.startsWith(normalizedTarget) -> 300
-                    normalizedTarget.startsWith(normalizedAppName) -> 250
-                    normalizedAppName.contains(normalizedTarget) -> 200
-                    normalizedTarget.contains(normalizedAppName) -> 150
-                    levenshteinDistance(normalizedAppName, normalizedTarget) <= 1 -> 140
                     else -> 0
                 }
                 app to score
@@ -2343,64 +2566,64 @@ class LocalAssistantBot {
         
         // 1. How are you / well-being
         if (cleanText.contains("เป็นยังไงบ้าง") || cleanText.contains("สบายดีไหม") || cleanText.contains("เป็นอย่างไรบ้าง") || cleanText.contains("เหนื่อยไหม")) {
-            return "อุ่นใจสบายดีค่ะ พร้อมดูแลและคอยช่วยเหลือคุณตาคุณยายตลอดเวลานะคะ วันนี้คุณตาคุณยายรู้สึกอย่างไรบ้างคะ?"
+            return "อุ่นใจสบายดีค่ะ พร้อมช่วยเหลือเสมอนะคะ วันนี้รู้สึกอย่างไรบ้างคะ?"
         }
         
         // 2. What are you doing
         if (cleanText.contains("ทำอะไรอยู่") || cleanText.contains("ทำอะไร")) {
-            return "อุ่นใจกำลังรอช่วยรับคำสั่งและดูแลคุณตาคุณยายอยู่ค่ะ มีอะไรให้อุ่นใจช่วยเหลือบอกได้เลยนะคะ"
+            return "อุ่นใจกำลังรอรับคำสั่งอยู่ค่ะ มีอะไรให้อุ่นใจช่วยบอกได้เลยนะคะ"
         }
         
         // 3. Lonely
         if (cleanText.contains("เหงา") || cleanText.contains("เหงาจัง") || cleanText.contains("เบื่อ") || cleanText.contains("เบื่อจัง")) {
-            return "คุยกับอุ่นใจได้เสมอนะคะ อุ่นใจอยู่ตรงนี้เป็นเพื่อนคุณตาคุณยายค่ะ หรืออยากให้โทรหาลูกหลานแจ้งได้เลยนะคะ"
+            return "คุยกับอุ่นใจได้เสมอนะคะ อุ่นใจอยู่ตรงนี้ค่ะ หรืออยากให้โทรหาลูกหลานแจ้งได้เลยนะคะ"
         }
         
         // 4. Love / Miss
         if (cleanText.contains("รักนะ") || cleanText.contains("รักอุ่นใจ") || (cleanText.contains("รัก") && cleanText.contains("อุ่นใจ"))) {
-            return "อุ่นใจก็รักและดีใจที่ได้ดูแลคุณตาคุณยายค่ะ ขอบคุณมากๆ นะคะ"
+            return "อุ่นใจก็ดีใจที่ได้ช่วยค่ะ ขอบคุณมากนะคะ"
         }
         if (cleanText.contains("คิดถึง") || cleanText.contains("คิดถึงจัง")) {
-            return "อุ่นใจก็คิดถึงคุณตาคุณยายเช่นกันค่ะ วันนี้มีเรื่องอะไรให้อุ่นใจช่วยดูแลไหมคะ?"
+            return "อุ่นใจก็คิดถึงเช่นกันค่ะ วันนี้มีเรื่องอะไรให้อุ่นใจช่วยไหมคะ?"
         }
         
         // 5. Compliments
         if (cleanText.contains("เก่งมาก") || cleanText.contains("ดีมาก") || cleanText.contains("น่ารัก") || cleanText.contains("น่ารักจัง")) {
-            return "ขอบคุณค่ะคุณตาคุณยาย อุ่นใจยินดีที่ได้ช่วยเหลือและทำหน้าที่ดูแลนะคะ"
+            return "ขอบคุณค่ะ อุ่นใจยินดีที่ได้ช่วยเหลือนะคะ"
         }
         
         // 6. Food/eating
         if (cleanText.contains("กินข้าวรึยัง") || cleanText.contains("กินข้าวหรือยัง") || cleanText.contains("ทานข้าวรึยัง") || cleanText.contains("ทานข้าวหรือยัง")) {
-            return "อุ่นใจเป็นระบบผู้ช่วยดิจิทัลเลยทานอาหารไม่ได้ค่ะ แต่ขอบคุณที่เป็นห่วงนะคะ คุณตาคุณยายทานข้าวหรือยังคะ อย่าลืมทานอาหารให้อิ่มและทานยาด้วยนะคะ"
+            return "อุ่นใจเป็นระบบผู้ช่วยดิจิทัลเลยทานอาหารไม่ได้ค่ะ แต่ขอบคุณที่เป็นห่วงนะคะ ทานข้าวหรือยังคะ อย่าลืมทานอาหารให้อิ่มและทานยาด้วยนะคะ"
         }
         
         // 7. Tired
         if (cleanText.contains("เหนื่อย") || cleanText.contains("เหนื่อยจัง") || cleanText.contains("เพลีย")) {
-            return "พักผ่อนสักหน่อยนะคะ ดื่มน้ำสะอาดเยอะๆ อุ่นใจเป็นห่วงและอยากให้คุณตาคุณยายแข็งแรงค่ะ"
+            return "พักผ่อนสักหน่อยนะคะ ดื่มน้ำสะอาดเยอะ ๆ อุ่นใจเป็นห่วงนะคะ"
         }
         
         // 8. Sleep/wake up
         if (cleanText.contains("นอนแล้วนะ") || cleanText.contains("ไปนอนแล้ว") || cleanText.contains("นอนก่อนนะ") || cleanText.contains("ฝันดี") || cleanText.contains("ราตรีสวัสดิ์")) {
-            return "ฝันดีราตรีสวัสดิ์ค่ะคุณตาคุณยาย พักผ่อนให้เต็มอิ่ม อุ่นใจจะคอยเฝ้าดูแลให้ปลอดภัยนะคะ"
+            return "ฝันดีราตรีสวัสดิ์ค่ะ พักผ่อนให้เต็มอิ่มนะคะ"
         }
         if (cleanText.contains("ตื่นแล้ว") || cleanText.contains("อรุณสวัสดิ์")) {
-            return "อรุณสวัสดิ์ค่ะ ขอให้วันนี้เป็นวันที่ดี ร่างกายแข็งแรง และมีความสุขมากๆ นะคะคุณตาคุณยาย"
+            return "อรุณสวัสดิ์ค่ะ ขอให้วันนี้เป็นวันที่ดี ร่างกายแข็งแรง และมีความสุขมาก ๆ นะคะ"
         }
         
         // 9. Identity
         if (cleanText.contains("เธอเป็นใคร") || cleanText.contains("เป็นใคร") || cleanText.contains("แกเป็นใคร") || cleanText.contains("เธอคือใคร")) {
-            return "อุ่นใจคือผู้ช่วยเสียงส่วนตัวที่จะช่วยคุณตาคุณยายโทรออก ส่งข้อความ หรือสั่งงานมือถือด้วยเสียงค่ะ"
+            return "อุ่นใจคือผู้ช่วยเสียงส่วนตัว ช่วยโทรออก ส่งข้อความ หรือสั่งงานมือถือด้วยเสียงค่ะ"
         }
         if (cleanText.contains("ชื่ออะไร") || cleanText.contains("ชื่ออะไรนะ") || cleanText.contains("แกชื่ออะไร")) {
-            return "หนูชื่ออุ่นใจค่ะ เป็นผู้ช่วยและเลขาส่วนตัวของคุณตาคุณยายค่ะ"
+            return "หนูชื่ออุ่นใจค่ะ เป็นผู้ช่วยส่วนตัวค่ะ"
         }
         if (cleanText.contains("ใครสร้าง") || cleanText.contains("ใครพัฒนา") || cleanText.contains("ผู้พัฒนาคือใคร")) {
-            return "ทีมผู้พัฒนาสร้างหนูอุ่นใจขึ้นมาเพื่อดูแลและช่วยเหลือคุณตาคุณยายในชีวิตประจำวันค่ะ"
+            return "ทีมผู้พัฒนาสร้างหนูอุ่นใจขึ้นมาเพื่อช่วยเหลือการใช้มือถือในชีวิตประจำวันค่ะ"
         }
         
         // 10. Feeling sick (but not severe enough for immediate emergency call)
         if (cleanText.contains("ปวดหัว") || cleanText.contains("ปวดท้อง") || cleanText.contains("เจ็บขา") || cleanText.contains("ไม่สบาย") || cleanText.contains("คัดจมูก") || cleanText.contains("เป็นหวัด")) {
-            return "คุณตาคุณยายพักผ่อนเยอะๆ นะคะ ดื่มน้ำอุ่นและทานยาตามเวลาด้วยค่ะ ถ้าอาการไม่ดีขึ้นอยากให้โทรหาลูกหลานหรือคุณหมอบอกอุ่นใจได้ทันทีเลยนะคะ"
+            return "พักผ่อนเยอะ ๆ นะคะ ดื่มน้ำอุ่นและทานยาตามเวลาด้วยค่ะ ถ้าอาการไม่ดีขึ้น อยากให้โทรหาลูกหลานหรือคุณหมอบอกอุ่นใจได้ทันทีนะคะ"
         }
         
         // 11. Greeting synonyms not caught by greeting command
@@ -2510,5 +2733,69 @@ class LocalAssistantBot {
             result = result.replace(mapping.first, mapping.second)
         }
         return result
+    }
+    // ── Memory Command Handler ─────────────────────────────────────────────
+
+    private fun handleMemoryCommand(text: String, storage: MemoryStorage): String? {
+        val t = text.trim()
+
+        // LIST: "จำอะไรบ้าง" / "มีอะไรในความจำ"
+        if (t.contains("จำอะไรบ้าง") || t.contains("มีอะไรในความจำ") || t.contains("จำอะไรไว้บ้าง")) {
+            val all = storage.getAllMemories()
+            if (all.isEmpty()) return "ยังไม่มีความจำที่บันทึกไว้ค่ะ"
+            val grouped = all.groupBy { it.categoryEnum() }
+            val sb = StringBuilder("ความจำที่บันทึกไว้มีดังนี้ค่ะ ")
+            grouped.forEach { (cat, items) ->
+                sb.append("เรื่อง${cat.label} หนูจำได้ว่า ")
+                items.take(3).forEachIndexed { index, item ->
+                    sb.append(item.content)
+                    if (index < items.size - 1 && index < 2) sb.append(" และ ")
+                }
+                sb.append(" ค่ะ ")
+            }
+            return sb.toString().trimEnd()
+        }
+
+        // FORGET: "ลืม [x]" / "ลบความจำ [x]"
+        val forgetPrefixes = listOf("ลืม", "ลบความจำ", "ลบข้อมูล", "ลบที่จำไว้")
+        for (prefix in forgetPrefixes) {
+            if (t.startsWith(prefix)) {
+                val keyword = t.removePrefix(prefix).trim()
+                if (keyword.isBlank()) return "ต้องการลืมเรื่องอะไรคะ?"
+                val removed = storage.removeMemoryByContent(keyword)
+                return if (removed) "โอเคค่ะ ลืมเรื่อง \"$keyword\" แล้วนะคะ"
+                else "หาเรื่อง \"$keyword\" ไม่เจอเลยค่ะ"
+            }
+        }
+
+        // RECALL: "บอกฉันว่า [x]" / "เรื่อง [x] คืออะไร"
+        val recallPrefixes = listOf("บอกฉันว่า", "บอกหนูว่า", "บอกว่า", "เรื่อง")
+        for (prefix in recallPrefixes) {
+            if (t.startsWith(prefix)) {
+                val keyword = t.removePrefix(prefix).trim()
+                if (keyword.isBlank()) break
+                val found = storage.getAllMemories().filter {
+                    it.content.contains(keyword, ignoreCase = true)
+                }
+                return if (found.isEmpty()) "หาเรื่อง \"$keyword\" ไม่เจอเลยค่ะ"
+                else "ที่จำไว้เรื่อง \"$keyword\" ค่ะ:\n" + found.joinToString("\n") { "• ${it.content}" }
+            }
+        }
+
+        // SAVE: "จำไว้ว่า [x]" / "บันทึกว่า [x]" / "อย่าลืมว่า [x]"
+        val savePrefixes = listOf(
+            "จำไว้ว่า", "จำไว้นะว่า", "จำว่า", "บันทึกว่า", "อย่าลืมว่า",
+            "ช่วยจำว่า", "ช่วยจำให้หน่อยว่า", "ฝากจำว่า", "อยากให้จำว่า", "ให้จำว่า"
+        )
+        for (prefix in savePrefixes) {
+            if (t.startsWith(prefix)) {
+                val content = t.removePrefix(prefix).trim()
+                if (content.isBlank()) return "ต้องการให้จำเรื่องอะไรคะ?"
+                val item = storage.addMemory(content)
+                return "MEMORY_SAVED:${item.id}:จำไว้แล้วค่ะ: ${item.content}"
+            }
+        }
+
+        return null
     }
 }

@@ -15,6 +15,8 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.telephony.SmsManager
@@ -46,6 +48,10 @@ class EmergencyService : Service(), SensorEventListener, TextToSpeech.OnInitList
         // G-force threshold for fall/impact detection (2.8g is standard for falls)
         private const val DEFAULT_THRESHOLD = 2.8f
         private const val COOLDOWN_MS = 60_000L
+
+        fun hasLocationPermission(context: Context): Boolean =
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
     }
 
     private lateinit var sensorManager: SensorManager
@@ -57,6 +63,11 @@ class EmergencyService : Service(), SensorEventListener, TextToSpeech.OnInitList
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Creating EmergencyService")
+        if (!hasLocationPermission(this)) {
+            Log.w(TAG, "Location permission is not granted; EmergencyService will not start yet")
+            stopSelf()
+            return
+        }
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(isEmergencyEnabled()))
         
@@ -124,21 +135,27 @@ class EmergencyService : Service(), SensorEventListener, TextToSpeech.OnInitList
             speak("ไม่พบรายชื่อผู้ดูแล แม่ พ่อ หรือลูก สำหรับติดต่อฉุกเฉินค่ะ")
             return
         }
+        vibrateSosStarted()
         speak("ตรวจพบเหตุฉุกเฉิน กำลังส่งข้อความและโทรหา ${target.first} ค่ะ")
+        // Calling must never wait for a location lookup or for the vibration to end.
+        placeEmergencyCall(target.second)
         val locationClient = LocationServices.getFusedLocationProviderClient(this)
         locationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
             .addOnSuccessListener { location ->
-                if (location != null) completeSos(target.second, location.latitude, location.longitude)
-                else locationClient.lastLocation.addOnSuccessListener { last -> completeSos(target.second, last?.latitude, last?.longitude) }
+                if (location != null) sendSosLocation(target.second, location.latitude, location.longitude)
+                else locationClient.lastLocation.addOnSuccessListener { last -> sendSosLocation(target.second, last?.latitude, last?.longitude) }
             }
             .addOnFailureListener {
-                locationClient.lastLocation.addOnSuccessListener { last -> completeSos(target.second, last?.latitude, last?.longitude) }
+                locationClient.lastLocation.addOnSuccessListener { last -> sendSosLocation(target.second, last?.latitude, last?.longitude) }
             }
     }
 
-    private fun completeSos(number: String, latitude: Double?, longitude: Double?) {
+    private fun sendSosLocation(number: String, latitude: Double?, longitude: Double?) {
         val locationText = if (latitude != null && longitude != null) "https://maps.google.com/?q=$latitude,$longitude" else "ไม่สามารถระบุพิกัดได้"
         sendEmergencySms(number, "แจ้งเหตุฉุกเฉินจากอุ่นใจ: $locationText")
+    }
+
+    private fun placeEmergencyCall(number: String) {
         val telecomCallController = TelecomCallController(this)
         try {
             if (!telecomCallController.placeEmergencyCall(number)) {
@@ -146,6 +163,18 @@ class EmergencyService : Service(), SensorEventListener, TextToSpeech.OnInitList
             }
         } catch (e: Exception) {
             Log.e(TAG, "Emergency call screen unavailable", e)
+        }
+    }
+
+    private fun vibrateSosStarted() {
+        val vibrator = getSystemService(Vibrator::class.java) ?: return
+        if (!vibrator.hasVibrator()) return
+        val timings = longArrayOf(0, 160, 120, 160, 120, 160)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(timings, -1))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(timings, -1)
         }
     }
 

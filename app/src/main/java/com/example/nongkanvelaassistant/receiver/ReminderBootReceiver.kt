@@ -34,6 +34,10 @@ class ReminderBootReceiver : BroadcastReceiver() {
     }
 
     private fun startEmergencyService(context: Context) {
+        if (!EmergencyService.hasLocationPermission(context)) {
+            Log.i(TAG, "Location permission has not been granted; EmergencyService will start after the app requests it")
+            return
+        }
         try {
             val serviceIntent = Intent(context, EmergencyService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
