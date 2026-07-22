@@ -738,11 +738,11 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     private fun getReminderSummaryText(): String {
         val list = _remindersList.value
         if (list.isEmpty()) return "ยังไม่มีรายการเตือนค่ะ"
-        val df = SimpleDateFormat("d MMMM yyyy เวลา HH:mm", Locale("th", "TH")).apply {
-            calendar = java.util.Calendar.getInstance(Locale("th", "TH"))
-        }
+        val df = SimpleDateFormat("d MMMM", Locale("th", "TH"))
         return "รายการเตือนทั้งหมดของคุณมีดังนี้ค่ะ:\n" + list.joinToString("\n") { 
-            "- ${it.title} เวลา ${df.format(Date(it.triggerAtMillis))}"
+            val calendar = java.util.Calendar.getInstance().apply { timeInMillis = it.triggerAtMillis }
+            val thaiDate = "${df.format(Date(it.triggerAtMillis))} ${calendar.get(java.util.Calendar.YEAR) + 543} เวลา ${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(it.triggerAtMillis))}"
+            "- ${it.title} วันที่ $thaiDate"
         }
     }
 
@@ -752,10 +752,9 @@ class VoiceAssistantViewModel(application: Application) : AndroidViewModel(appli
     }
 
     private fun getTodayDateText(): String {
-        val df = SimpleDateFormat("EEEEที่ d MMMM yyyy", Locale("th", "TH")).apply {
-            calendar = java.util.Calendar.getInstance(Locale("th", "TH"))
-        }
-        return "วันนี้คือวัน${df.format(Date())} ค่ะ"
+        val now = java.util.Calendar.getInstance()
+        val df = SimpleDateFormat("EEEEที่ d MMMM", Locale("th", "TH"))
+        return "วันนี้คือวัน${df.format(Date())} ${now.get(java.util.Calendar.YEAR) + 543} ค่ะ"
     }
 
     private fun normalizeContactName(name: String): String {
